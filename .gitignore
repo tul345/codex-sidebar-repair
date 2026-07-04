@@ -1,0 +1,25 @@
+.pytest_cache/
+.ruff_cache/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+dist/
+build/
+
+# Never commit local Codex user data.
+*.sqlite
+*.sqlite-*
+*.db
+*.jsonl
+.codex-global-state.json
+session_index*.json
+session_index*.jsonl
+sessions/
+archived_sessions/
+backups/
+backups_state/
+*.bak
+*.log
+
