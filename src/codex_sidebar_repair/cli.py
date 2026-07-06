@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -18,6 +19,7 @@ except ModuleNotFoundError:  # pragma: no cover
 
 
 THREAD_KEY_PREFIXES = ("local:", "remote:", "pending-worktree:")
+MODEL_RESPONSE_ITEM_TYPES = {"reasoning", "function_call", "custom_tool_call"}
 
 
 @dataclass
@@ -166,6 +168,37 @@ def backup_file(path: Path, report: RepairReport) -> None:
             destination = backup_dir / f"{candidate.name}.{suffix}.bak"
             suffix += 1
         shutil.copy2(candidate, destination)
+
+
+def is_model_response_item(payload: dict[str, Any]) -> bool:
+    item_type = payload.get("type")
+    if item_type in MODEL_RESPONSE_ITEM_TYPES:
+        return True
+    if item_type == "message" and payload.get("role") == "assistant":
+        return True
+    if payload.get("call_type") in {"function_call", "custom_tool_call"}:
+        return True
+    return False
+
+
+def synthetic_response_item_id(
+    thread_id: str | None, turn_id: str | None, line_no: int, payload: dict[str, Any]
+) -> str:
+    seed = json.dumps(
+        {
+            "thread_id": thread_id,
+            "turn_id": turn_id,
+            "line_no": line_no,
+            "type": payload.get("type"),
+            "role": payload.get("role"),
+            "name": payload.get("name"),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()[:16]
+    return f"repair-{digest}"
 
 
 def user_thread_filter_sql() -> str:
@@ -393,6 +426,135 @@ def repair_rollouts(rows: list[dict[str, Any]], provider: str, report: RepairRep
         report.add_warning(f"unreadable rollout files={unreadable}")
 
 
+def repair_session_jsonl_compat(
+    codex_home: Path, report: RepairReport, drop_invalid_lines: bool = False
+) -> None:
+    sessions_root = codex_home / "sessions"
+    if not sessions_root.exists():
+        report.add_check("session JSONL compatibility: no sessions directory")
+        return
+
+    files_seen = 0
+    files_changed = 0
+    invalid_files = 0
+    invalid_lines_total = 0
+    dropped_invalid_lines = 0
+    skipped_invalid_files = 0
+    turn_context_updates = 0
+    response_id_updates = 0
+    response_turn_id_updates = 0
+
+    for path in sorted(sessions_root.rglob("*.jsonl")):
+        files_seen += 1
+        current_turn_id: str | None = None
+        thread_id: str | None = None
+        file_changed = False
+        file_turn_context_updates = 0
+        file_response_id_updates = 0
+        file_response_turn_id_updates = 0
+        invalid_lines: list[int] = []
+        out_lines: list[str] = []
+
+        try:
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError as exc:
+            report.add_warning(f"{path}: cannot read session jsonl: {exc}")
+            continue
+
+        for line_no, raw in enumerate(lines, 1):
+            if not raw.strip():
+                out_lines.append(raw)
+                continue
+            try:
+                obj = json.loads(raw)
+            except json.JSONDecodeError:
+                invalid_lines.append(line_no)
+                if not drop_invalid_lines:
+                    out_lines.append(raw)
+                else:
+                    file_changed = True
+                continue
+
+            payload = obj.get("payload")
+            line_changed = False
+            if obj.get("type") == "session_meta" and isinstance(payload, dict):
+                if isinstance(payload.get("id"), str):
+                    thread_id = payload["id"]
+            elif obj.get("type") == "turn_context" and isinstance(payload, dict):
+                if isinstance(payload.get("turn_id"), str):
+                    current_turn_id = payload["turn_id"]
+                if "multi_agent_version" not in payload:
+                    payload["multi_agent_version"] = "v1"
+                    file_turn_context_updates += 1
+                    line_changed = True
+            elif obj.get("type") == "response_item" and isinstance(payload, dict):
+                if is_model_response_item(payload):
+                    if "id" not in payload:
+                        payload["id"] = synthetic_response_item_id(
+                            thread_id, current_turn_id, line_no, payload
+                        )
+                        file_response_id_updates += 1
+                        line_changed = True
+                    if current_turn_id:
+                        metadata = payload.get("metadata")
+                        if not isinstance(metadata, dict):
+                            metadata = {}
+                            payload["metadata"] = metadata
+                        if "turn_id" not in metadata:
+                            metadata["turn_id"] = current_turn_id
+                            file_response_turn_id_updates += 1
+                            line_changed = True
+
+            if line_changed:
+                file_changed = True
+                out_lines.append(json.dumps(obj, ensure_ascii=False, separators=(",", ":")))
+            else:
+                out_lines.append(raw)
+
+        if invalid_lines:
+            invalid_files += 1
+            invalid_lines_total += len(invalid_lines)
+            if drop_invalid_lines:
+                dropped_invalid_lines += len(invalid_lines)
+            else:
+                report.add_warning(
+                    f"{path}: invalid JSONL lines={len(invalid_lines)}; "
+                    "pass --drop-invalid-jsonl-lines with --apply to remove them"
+                )
+                skipped_invalid_files += 1
+                continue
+
+        if not file_changed:
+            continue
+
+        files_changed += 1
+        turn_context_updates += file_turn_context_updates
+        response_id_updates += file_response_id_updates
+        response_turn_id_updates += file_response_turn_id_updates
+        if report.apply:
+            backup_file(path, report)
+            path.write_text("\n".join(out_lines) + "\n", encoding="utf-8", newline="\n")
+            report.mark_changed(path)
+
+    if files_changed:
+        report.add_action(
+            "session JSONL compatibility updates: "
+            f"files={files_changed}, turn_context_v1={turn_context_updates}, "
+            f"response_ids={response_id_updates}, "
+            f"response_turn_ids={response_turn_id_updates}, "
+            f"dropped_invalid_lines={dropped_invalid_lines}, "
+            f"skipped_invalid_files={skipped_invalid_files}"
+        )
+    else:
+        report.add_check("session JSONL compatibility: no changes needed")
+    report.add_check(
+        "session JSONL compatibility scan: "
+        f"files={files_seen}, invalid_files={invalid_files}, "
+        f"invalid_lines={invalid_lines_total}, "
+        f"skipped_invalid_files={skipped_invalid_files}"
+    )
+
+
 def all_user_rows_for_rollouts(codex_home: Path) -> list[dict[str, Any]]:
     rows: dict[str, dict[str, Any]] = {}
     for path in sqlite_paths(codex_home):
@@ -592,6 +754,10 @@ def run_repair(args: argparse.Namespace) -> int:
             rows_for_global[row["id"]] = row
     if not args.no_rollouts:
         repair_rollouts(all_user_rows_for_rollouts(codex_home), provider, report)
+    if args.repair_jsonl_compat:
+        repair_session_jsonl_compat(
+            codex_home, report, drop_invalid_lines=args.drop_invalid_jsonl_lines
+        )
     if not args.no_global_state:
         sync_global_state(list(rows_for_global.values()), report)
 
@@ -642,9 +808,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     subparsers = parser.add_subparsers(dest="command", required=True)
     doctor = subparsers.add_parser("doctor", help="Read-only diagnostics.")
+    doctor.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
     doctor.set_defaults(func=run_doctor)
 
     repair = subparsers.add_parser("repair", help="Preview or apply repair.")
+    repair.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
     repair.add_argument("--apply", action="store_true", help="Write backups and changes.")
     repair.add_argument(
         "--no-rollouts",
@@ -660,6 +828,22 @@ def build_parser() -> argparse.ArgumentParser:
         "--repair-user-flags",
         action="store_true",
         help="Also force user-owned rows to thread_source=user and has_user_event=1.",
+    )
+    repair.add_argument(
+        "--repair-jsonl-compat",
+        action="store_true",
+        help=(
+            "Also repair session JSONL compatibility metadata for older Codex "
+            "Desktop runtimes."
+        ),
+    )
+    repair.add_argument(
+        "--drop-invalid-jsonl-lines",
+        action="store_true",
+        help=(
+            "With --repair-jsonl-compat, remove invalid JSONL lines after backup. "
+            "Valid records are preserved."
+        ),
     )
     repair.set_defaults(func=run_repair)
     return parser
